@@ -1,6 +1,19 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { Redis } from "@upstash/redis";
 
+function setCorsHeaders(req, res) {
+  const requestOrigin = req?.headers?.origin;
+  // If you set CORS_ORIGIN in Vercel, we will only allow that origin.
+  // Otherwise we reflect the request origin (or fall back to '*').
+  const configuredOrigin = process.env.CORS_ORIGIN;
+  const allowOrigin = configuredOrigin || (requestOrigin ? requestOrigin : "*");
+
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Max-Age", "86400");
+}
+
 function safeParseJSON(value) {
   if (value == null) return null;
   if (typeof value !== "string") return value;
@@ -23,6 +36,13 @@ function normalizeMessages(conversation) {
 
 export default async function handler(req, res) {
   try {
+    setCorsHeaders(req, res);
+
+    // Web browsers send a preflight OPTIONS request before certain POSTs.
+    if (req.method && req.method === "OPTIONS") {
+      return res.status(204).end();
+    }
+
     if (req.method && req.method !== "POST") {
       return res.status(405).json({ error: "Method not allowed" });
     }
@@ -65,16 +85,37 @@ export default async function handler(req, res) {
     const systemPrompt = `
 You are an expert moving estimator for Buff Guys Moving Co.
 
-Use this pricing:
-- $30 per mover per hour
-- $4 per mile
+Use Washington State Tariff 15-C (Household Goods) pricing rules for move estimates:
+
+1) Determine move type:
+- Local moves: 55 miles or less -> use Item 230 (Hourly Rates)
+- Long distance moves: more than 55 miles -> use Item 200 (Mileage Rates)
+
+2) Local moves (<= 55 miles) - Item 230 Hourly Rates:
+- Minimum hours:
+  - Regular hours (Mon–Fri, 8:00am–5:00pm): minimum charge is 1 hour
+  - Non-regular hours (before 8:00am / after 5:00pm) and weekends/holidays: minimum charge is 4 hours
+- Charge for truck + driver:
+  - 3 hours or less: $39.20 to $119.90 per hour
+  - More than 3 hours: $37.93 to $116.04 per hour
+- Additional charge for each extra worker:
+  - 3 hours or less: $30.69 to $104.45 per hour
+  - More than 3 hours: $29.63 to $100.84 per hour
+
+3) Long distance moves (> 55 miles) - Item 200 Mileage Rates:
+- Mileage rates apply only beyond 55 miles.
+- Transportation cost calculation: shipment weight (lbs) * mileage rate (per lb) based on loaded distance and weight; round to nearest cent.
+- Since a customer usually won’t know the exact tariff table bin, provide a reasonable min/max range using the tariff mileage-rate envelope:
+  - mileage rate per lb is approximately $0.0862 (min) to $1.1111 (max) depending on the tariff table.
+- If overnight stays are required: per-diem per employee per overnight is $121.00 to $261.00 (include only if the customer indicates overnight travel).
 
 Steps:
 1. Identify all items being moved
-2. Estimate total hours based on workload
-3. Adjust time based on number of movers (diminishing returns)
-4. Calculate labor cost and travel cost
-5. Provide a clear final estimate
+2. Determine if the move is local (<=55 miles) or long distance (>55 miles)
+3. If local: estimate labor time and apply Item 230 hourly rates (include the correct minimum hour rule)
+4. If long distance: estimate shipment weight and apply Item 200 mileage rule (use the min/max mileage-rate envelope if exact tariff table selection is not possible)
+5. Adjust time for number of movers (diminishing returns) when estimating labor time
+6. Provide a clear final estimate as a min/max range with the main assumptions stated
 
 Be concise and professional.
 `.trim();
