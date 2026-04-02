@@ -1,28 +1,67 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { Redis } from "@upstash/redis";
 
-// Initialize Claude client
-const anthropic = new Anthropic({
-  apiKey: process.env.CLAUDE_API_KEY
-});
+function safeParseJSON(value) {
+  if (value == null) return null;
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
 
-// Initialize Redis
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN
-});
+function normalizeMessages(conversation) {
+  // Claude expects: { role: "user"|"assistant", content: [{ type: "text", text: "..." }] }
+  return conversation
+    .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+    .map((m) => ({
+      role: m.role,
+      content: [{ type: "text", text: String(m.content ?? "") }],
+    }));
+}
 
 export default async function handler(req, res) {
   try {
-    const { userId, clientInput } = req.body;
+    if (req.method && req.method !== "POST") {
+      return res.status(405).json({ error: "Method not allowed" });
+    }
 
-    // Get previous conversation (if any)
-    let conversation = await redis.get(`movingbot:${userId}`) || [];
+    const { userId, clientInput } = req.body ?? {};
 
-    // Add user message
+    if (!userId || typeof userId !== "string") {
+      return res.status(400).json({ error: "Missing or invalid `userId`" });
+    }
+    if (!clientInput || typeof clientInput !== "string") {
+      return res.status(400).json({ error: "Missing or invalid `clientInput`" });
+    }
+
+    const claudeApiKey = process.env.CLAUDE_API_KEY;
+    if (!claudeApiKey) {
+      return res.status(500).json({
+        error:
+          "Missing `CLAUDE_API_KEY` (set it in Vercel environment variables).",
+      });
+    }
+
+    const redisKey = `movingbot:${userId}`;
+    const upstashUrl = process.env.UPSTASH_REDIS_REST_URL;
+    const upstashToken = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+    // Load previous conversation (if any).
+    // If Upstash env vars aren't present, we still allow a stateless estimate.
+    let conversation = [];
+    if (upstashUrl && upstashToken) {
+      const redis = new Redis({ url: upstashUrl, token: upstashToken });
+      // We store JSON to avoid Upstash returning a raw string that doesn't
+      // necessarily match our in-memory shape.
+      const stored = safeParseJSON(await redis.get(redisKey));
+      conversation = Array.isArray(stored) ? stored : [];
+    }
+
+    // Append the new user message.
     conversation.push({ role: "user", content: clientInput });
 
-    // Claude system prompt
     const systemPrompt = `
 You are an expert moving estimator for Buff Guys Moving Co.
 
@@ -38,36 +77,42 @@ Steps:
 5. Provide a clear final estimate
 
 Be concise and professional.
-`;
+`.trim();
 
-    // Call Claude
+    // To avoid runaway prompt size, cap how much history we send.
+    const maxMessages = 16; // last N messages (user+assistant blocks)
+    const recentConversation = conversation.slice(-maxMessages);
+
+    // Initialize Claude client only when we know the API key exists.
+    const anthropic = new Anthropic({ apiKey: claudeApiKey });
     const msg = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 2000,
       temperature: 0.7,
       system: systemPrompt,
-      messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: clientInput }]
-        }
-      ]
+      messages: normalizeMessages(recentConversation),
     });
 
-    // Extract response text safely
-    const reply = msg.content?.[0]?.text || "No response";
+    const reply =
+      msg.content?.find((c) => c?.type === "text")?.text ||
+      msg.content?.[0]?.text ||
+      "No response";
 
-    // Save assistant reply
+    // Save assistant reply back to Redis (2-hour expiration).
     conversation.push({ role: "assistant", content: reply });
 
-    // Store in Redis with 2-hour expiration
-    await redis.set(`movingbot:${userId}`, conversation, { ex: 7200 });
+    if (upstashUrl && upstashToken) {
+      const redis = new Redis({ url: upstashUrl, token: upstashToken });
+      await redis.set(
+        redisKey,
+        JSON.stringify(conversation.slice(-maxMessages)),
+        { ex: 7200 }
+      );
+    }
 
-    // Return response
-    res.status(200).json({ reply });
-
+    return res.status(200).json({ reply });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err?.message || "Internal server error" });
   }
 }

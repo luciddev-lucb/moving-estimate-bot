@@ -1,13 +1,16 @@
 {
   "name": "moving-estimates-bot",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Buff Guys Moving AI estimate bot",
+  "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs"
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.82.0",
+    "@upstash/redis": "^1.37.0"
+  }
 }
